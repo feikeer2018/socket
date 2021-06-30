@@ -1,0 +1,176 @@
+/*
+ * To change this license header, choose License Headers in Project Properties.
+ * To change this template file, choose Tools | Templates
+ * and open the template in the editor.
+ */
+#include<stdlib.h>
+#include<pthread.h>
+#include<netinet/in.h> 
+#include<sys/types.h>   
+#include<sys/socket.h>  
+#include<stdio.h>      
+#include<string.h>     
+#include<arpa/inet.h>
+#include<unistd.h>
+using namespace std;
+
+#define CAN_SERVICE "/tmp/CAN_SERVICE" 
+#define MAX_NUM     5
+struct sockaddr_un{
+    sa_family_t    sun_family;        // AF_UNIX
+    char    sun_path[20];  // 路径名
+};
+class CServer
+{
+private:
+    int m_listenfd;
+    int m_clientfd;
+    fd_set rset;   //待处理fd
+    fd_set allset; //现有有效的fd
+    int m_client[MAX_NUM];
+    int m_maxfd;
+
+public:
+    CServer();
+    ~CServer();
+    bool initserver(const int port);
+    bool Accept();
+    ssize_t Recv(void *buf ,ssize_t len);
+    ssize_t Send(const void *buf ,ssize_t len);
+    bool  Handle();
+};
+CServer::CServer()
+{
+    m_listenfd =0;
+    m_clientfd =0;
+    for(int i=0;i< MAX_NUM;i++){
+        m_client[i]=-1;
+    }
+}
+CServer::~CServer()
+{
+   if(m_listenfd>0) close(m_listenfd);
+   if(m_clientfd>0) close(m_clientfd);
+}
+bool CServer::initserver(const int port)
+{
+    // 创建socket，若成功，返回socket描述符   
+    //1、domain：即协议域，又称为协议族（family）。AF_INET：TCP/IP协议簇
+    //2、type：指定socket类型。SOCK_STREAM（常用）字节流套接字
+    //3、protocol：故名思意，就是指定协议。0：IPPROTO_TCP TCP传输协议 
+    //m_listenfd=socket(AF_INET,SOCK_STREAM,0);//监听,服务器的socket
+       
+    m_listenfd=socket(PF_UNIX,SOCK_STREAM,0);
+    if(m_listenfd <0){
+        perror("cannot create communication socket");  
+        return false;  
+    }
+    /************************IP 地址通讯 *********************** 
+    struct sockaddr_in serveaddr;
+    memset(&serveaddr,0,sizeof(serveaddr));
+    serveaddr.sin_family=AF_INET;   //ipv4协议族
+    serveaddr.sin_addr.s_addr=htonl(INADDR_ANY);//转换过来就是0.0.0.0，泛指本机的意思
+    serveaddr.sin_port=htons(port);
+    ************** IP 地址通讯 **********************/
+    struct sockaddr_un serveaddr;  
+    serveaddr.sun_family=AF_UNIX;  //进程间通讯
+    strncpy(serveaddr.sun_path,CAN_SERVICE,sizeof(serveaddr.sun_path)-1);  
+    unlink(CAN_SERVICE); //close 叫  CAN_SERVICE  的连接  
+    if( -1 == bind(m_listenfd,(struct sockaddr*)&serveaddr,sizeof(serveaddr))){
+        perror("cannot bind server socket:");
+        close(m_listenfd);
+        return false;
+    }
+    //sockfd：第一个参数即为要监听的socket描述符
+    //backlog : 第二个参数为相应socket可以排队的最大连接个数
+    //socket()函数创建的socket默认是一个主动类型的，listen函数将socket变为被动类型的，等待客户的连接请求。
+    if(listen(m_listenfd,MAX_NUM)!=0){
+        perror("listen");close(m_listenfd);return false;
+    }
+    FD_ZERO(&allset);
+    FD_SET(m_listenfd,&allset);
+    m_maxfd =m_listenfd;
+    return true;
+}
+bool CServer::Accept()
+{
+    rset =allset;
+    int readyfd;
+    readyfd =select(m_maxfd+1,&rset,NULL,NULL,NULL);
+    if(readyfd <0){
+        perror("select error !");
+        return false;
+    }
+    if(FD_ISSET(m_listenfd,&rset)){
+         int socklen;
+         //int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+        //sockfd：第一个参数为服务器的socket描述符
+        //addr：，第二个参数为指向struct sockaddr *的指针，用于返回客户端的协议地址
+        //addrlen：第三个参数为协议地址的长度
+        //返回值 : 如果accpet成功，那么其返回值是由内核自动生成的一个全新的描述字，代表与返回客户的TCP连接。 
+
+        // 接受连接请求，返回一个新的socket(描述符)，这个新socket用于同连接的客户端通信   
+        // accept函数会把连接到的客户端信息写到client_addr中  
+        struct sockaddr_un clientaddr;  //客户端的地址信息
+        m_clientfd=accept(m_listenfd,(struct sockaddr *)&clientaddr,(socklen_t*)&socklen);
+        if(m_clientfd<0)  return false;
+        printf("new client accepted name %s \n",clientaddr.sun_path);
+        for(int i=0;i<MAX_NUM;i++){
+            if(m_client[i]<0){
+                m_client[i]=m_clientfd;
+                break;
+            }
+        }
+        FD_SET(m_clientfd,&allset);
+        if(m_clientfd > m_maxfd) m_maxfd =m_clientfd;
+    }
+    return true;
+}
+
+ssize_t CServer::Recv(void *buf,ssize_t len)
+{
+    memset(buf,0,len);
+    return recv(m_clientfd,buf,len,0);
+}
+ssize_t CServer::Send(const void *buf,ssize_t len)
+{
+    return send(m_clientfd,buf,len,0);
+}
+bool CServer::Handle()
+{   
+    ssize_t len;
+    char buffer[1024];
+    for(int i =0;i<MAX_NUM;i++){
+        m_clientfd = m_client[i];
+        if(m_client[i]<0){
+            continue;
+        }
+        if(FD_ISSET(m_clientfd,&rset)){
+            len = Recv(buffer,sizeof(buffer));
+            if(len <=0){
+                printf("client[%d] exit \n",i);
+                close(m_clientfd);
+                FD_CLR(m_clientfd,&allset);
+                m_client[i]=-1;
+            }else{
+                printf("recv :%s \n",buffer);
+                Send((const char*)buffer,len);
+            }
+        }
+    }
+}
+//-------------------------------------
+int main()
+{
+    CServer server;
+    if(server.initserver(5000)==false){
+        printf("**** server build faild \n");
+        return -1;
+    }
+    while(true)
+    {
+        server.Accept();
+        server.Handle();
+    }
+    return 0;
+}
